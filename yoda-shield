@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# yoda-shield - Sanitização de dados antes do YodaDB
+# Uso: cat data.tsv | ./yoda-shield | ./yodadb put 1
+
+set -e
+
+while IFS= read -r line; do
+    original="$line"
+    masked=false
+    
+    # 1. OpenAI API Keys (sk-...)
+    if [[ "$line" =~ sk-[A-Za-z0-9]{20,} ]]; then
+        key="${BASH_REMATCH[0]}"
+        line="${line//$key/sk-********}"
+        masked=true
+    fi
+    
+    # 2. AWS Keys (AKIA...)
+    if [[ "$line" =~ AKIA[0-9A-Z]{16} ]]; then
+        key="${BASH_REMATCH[0]}"
+        line="${line//$key/AKIA********}"
+        masked=true
+    fi
+    
+    # 3. GitHub Tokens (ghp_...)
+    if [[ "$line" =~ ghp_[A-Za-z0-9]{36} ]]; then
+        key="${BASH_REMATCH[0]}"
+        line="${line//$key/ghp_********}"
+        masked=true
+    fi
+    
+    # 4. Email
+    if [[ "$line" =~ [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,} ]]; then
+        email="${BASH_REMATCH[0]}"
+        line="${line//$email/email@masked.com}"
+        masked=true
+    fi
+    
+    # 5. CPF
+    if [[ "$line" =~ [0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2} ]]; then
+        cpf="${BASH_REMATCH[0]}"
+        line="${line//$cpf/***.***.***-**}"
+        masked=true
+    fi
+    
+    # 6. Secrets (password=, token=, secret=, api_key=)
+    if [[ "$line" =~ (password|passwd|secret|api_key|token)[[:space:]]*=[[:space:]]*[\"\']?([^\"\'[:space:]]+) ]]; then
+        secret="${BASH_REMATCH[2]}"
+        line="${line//$secret/********}"
+        masked=true
+    fi
+    
+    # Log se mascarou (stderr)
+    if [ "$masked" = true ]; then
+        echo "[SHIELD] Mascarado: ${original:0:50}..." >&2
+    fi
+    
+    echo "$line"
+done

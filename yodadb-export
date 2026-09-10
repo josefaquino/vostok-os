@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# yodadb-export: Exporta YodaDB para Parquet (Unix puro)
+#
+# Uso:
+#   ./yodadb-export <storage_path> <output.parquet>
+#   ./yodadb-export yoda_storage.log output.parquet
+
+set -e
+
+if [ $# -lt 2 ]; then
+    echo "Uso: yodadb-export <storage_path> <output.parquet>"
+    echo ""
+    echo "Exemplo:"
+    echo "  ./yodadb-export yoda_storage.log output.parquet"
+    echo ""
+    echo "Depois consulte com DuckDB:"
+    echo "  duckdb -c \"SELECT * FROM 'output.parquet' LIMIT 10\""
+    exit 1
+fi
+
+STORAGE="$1"
+OUTPUT="$2"
+CSV_TMP="/tmp/yodadb_export_$$.csv"
+
+if [ ! -f "$STORAGE" ]; then
+    echo "❌ Arquivo não encontrado: $STORAGE"
+    exit 1
+fi
+
+echo "📖 Lendo $STORAGE..."
+./yodadb export "$STORAGE" "$CSV_TMP"
+
+echo "🔄 Convertendo para Parquet..."
+duckdb -c "COPY (SELECT * FROM read_csv_auto('$CSV_TMP')) TO '$OUTPUT' (FORMAT PARQUET, COMPRESSION SNAPPY);" 2>/dev/null
+
+echo "✅ Exportado: $OUTPUT"
+ls -lh "$OUTPUT"
+echo ""
+echo "🔍 Primeiros registros:"
+duckdb -c "SELECT * FROM '$OUTPUT' LIMIT 3" -markdown
+
+rm -f "$CSV_TMP"

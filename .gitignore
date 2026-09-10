@@ -1,0 +1,42 @@
+yodadb
+yodadb-server
+yodadb-client
+*.o
+*.a
+*.log
+*.dat
+*.tsv
+*.csv
+*.parquet
+.yoda-research-cache.txt
+.yoda-exclude
+archive/
+venv_yodadb/
+*.zip
+.yoda-branches/
+yoda_storage.log.ro.lock
+*.lock
+
+# Arquivos grandes removidos do versionamento
+vostok.log
+*.parquet
+*.dat
+.yoda-branches/
+venv_yodadb/
+archive/
+
+# Nunca commitar PDFs gerados localmente
+docs/PITCH_DECK.pdf
+
+# Diretórios grandes (NUNCA versionar)
+archive/
+venv_yodadb/
+.yoda-branches/
+
+# Arquivos de teste
+*.parquet
+*.dat
+vostok.log
+kyber.log
+wal.log
+.cdc.*

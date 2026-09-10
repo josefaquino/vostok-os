@@ -1,0 +1,347 @@
+package db
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"syscall"
+	"time"
+	"vostok/pkg/kyber"
+)
+
+const (
+	BloomSize  = 256 * 1024 * 1024
+	MagicByte  = byte(0xAA)
+	HeaderSize = 18
+)
+
+type YodaDB struct {
+	BloomFilter []byte
+	bloomFile   *os.File
+	storageFile *os.File
+	lockFile    *os.File
+	writeBuffer *bufio.Writer
+	kyberDB     *kyber.KyberDB // NOVO: índice B-tree
+	kyberPath   string         // NOVO: caminho do arquivo do índice
+	mu          sync.RWMutex
+	skipped     uint64
+	Ingested    uint64
+	storagePath string
+	bloomPath   string
+}
+
+func NewYodaDB(bloomPath, storagePath string) (*YodaDB, error) {
+	lockPath := "/tmp/yodadb.lock"
+	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao abrir arquivo de lock: %v", err)
+	}
+
+	if err := syscall.Flock(int(lFile.Fd()), syscall.LOCK_EX); err != nil {
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao adquirir lock: %v", err)
+	}
+
+	bFile, err := os.OpenFile(bloomPath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao abrir arquivo do Bloom Filter: %v", err)
+	}
+
+	fi, err := bFile.Stat()
+	if err != nil {
+		bFile.Close()
+		lFile.Close()
+		return nil, err
+	}
+	if fi.Size() < int64(BloomSize) {
+		if err := bFile.Truncate(int64(BloomSize)); err != nil {
+			bFile.Close()
+			lFile.Close()
+			return nil, fmt.Errorf("falha ao truncar arquivo do Bloom Filter: %v", err)
+		}
+	}
+
+	mmap, err := syscall.Mmap(int(bFile.Fd()), 0, BloomSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		bFile.Close()
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao mapear mmap: %v", err)
+	}
+
+	sFile, err := os.OpenFile(storagePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		syscall.Munmap(mmap)
+		bFile.Close()
+
+	// CORREÇÃO: Mover cursor para o final do arquivo
+	// (evita sobrescrever dados existentes ao reabrir)
+	if _, err := sFile.Seek(0, io.SeekEnd); err != nil {
+		sFile.Close()
+		return nil, fmt.Errorf("falha ao buscar final do storage: %v", err)
+	}
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao abrir arquivo de storage: %v", err)
+	}
+
+	// NOVO: Abrir KyberDB para indexação
+	kyberPath := storagePath + ".kyber"
+	kDB, err := kyber.NewKyberDB(kyberPath)
+	if err != nil {
+		sFile.Close()
+		syscall.Munmap(mmap)
+		bFile.Close()
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao abrir KyberDB: %v", err)
+	}
+
+	return &YodaDB{
+		BloomFilter: mmap,
+		bloomFile:   bFile,
+		storageFile: sFile,
+		lockFile:    lFile,
+		writeBuffer: bufio.NewWriterSize(sFile, 8*1024*1024),
+		kyberDB:     kDB,
+		kyberPath:   kyberPath,
+		storagePath: storagePath,
+		bloomPath:   bloomPath,
+	}, nil
+}
+
+// WriteRecord grava um registro no storage e indexa a primeira coluna do TSV
+// na B-tree (KyberDB). O payload deve estar no formato TSV.
+func (db *YodaDB) WriteRecord(workerID uint32, healthScore uint8, payload []byte) error {
+	payloadSize := uint32(len(payload))
+	timestamp := uint64(time.Now().UnixNano())
+
+	header := make([]byte, HeaderSize)
+	header[0] = MagicByte
+	binary.BigEndian.PutUint64(header[1:9], timestamp)
+	binary.BigEndian.PutUint32(header[9:13], workerID)
+	header[13] = healthScore
+	binary.BigEndian.PutUint32(header[14:18], payloadSize)
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// NOVO: Calcular offset exato onde este registro será gravado
+	// Offset = posição atual no arquivo + bytes pendentes no buffer
+	fileOffset, err := db.storageFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("falha ao obter offset: %v", err)
+	}
+	buffered := int64(db.writeBuffer.Buffered())
+	recordOffset := fileOffset + buffered
+
+	if _, err := db.writeBuffer.Write(header); err != nil {
+		return err
+	}
+	if _, err := db.writeBuffer.Write(payload); err != nil {
+		return err
+	}
+
+	// NOVO: Indexar primeira coluna do TSV na B-tree
+	if len(payload) > 0 {
+		key := db.extractFirstColumn(payload)
+		if len(key) > 0 {
+			// Converter offset (uint64) para []byte (8 bytes big-endian)
+			offsetBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(offsetBytes, uint64(recordOffset))
+
+			if err := db.kyberDB.Put(key, offsetBytes); err != nil {
+				// Log mas não falha a ingestão (degradação graciosa)
+				fmt.Fprintf(os.Stderr, "⚠️  falha ao indexar chave '%s': %v\n", string(key), err)
+			}
+		}
+	}
+
+	db.Ingested++
+	return nil
+}
+
+// extractFirstColumn extrai a primeira coluna de um payload TSV
+func (db *YodaDB) extractFirstColumn(payload []byte) []byte {
+	// Encontrar o primeiro tab ou newline
+	for i, b := range payload {
+		if b == '\t' || b == '\n' {
+			return payload[:i]
+		}
+	}
+	// Se não encontrou delimitador, retorna tudo (até 256 bytes para segurança)
+	if len(payload) > 256 {
+		return payload[:256]
+	}
+	return payload
+}
+
+// Get busca um registro pela chave (primeira coluna do TSV)
+// Retorna o payload completo do registro encontrado
+func (db *YodaDB) Get(key []byte) ([]byte, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.kyberDB == nil {
+		return nil, fmt.Errorf("banco não inicializado")
+	}
+
+	// Buscar offset na B-tree
+	offsetBytes, err := db.kyberDB.Get(key)
+	if err != nil {
+		return nil, fmt.Errorf("chave não encontrada: %v", err)
+	}
+	if len(offsetBytes) != 8 {
+		return nil, fmt.Errorf("offset inválido na B-tree")
+	}
+
+	offset := int64(binary.BigEndian.Uint64(offsetBytes))
+
+	// NOVO: Fazer flush do buffer para garantir que os dados estejam no disco
+	// (apenas se o offset estiver dentro do buffer pendente)
+	fileOffset, _ := db.storageFile.Seek(0, io.SeekCurrent)
+	buffered := int64(db.writeBuffer.Buffered())
+	bufferStart := fileOffset
+
+	if offset >= bufferStart && offset < bufferStart+buffered {
+		// Offset está no buffer pendente, precisa fazer flush
+		db.mu.RUnlock()
+		db.mu.Lock()
+		db.writeBuffer.Flush()
+		db.mu.Unlock()
+		db.mu.RLock()
+	}
+
+	// Ler header (18 bytes) a partir do offset
+	header := make([]byte, HeaderSize)
+	if _, err := db.storageFile.ReadAt(header, offset); err != nil {
+		return nil, fmt.Errorf("falha ao ler header: %v", err)
+	}
+
+	// Validar magic byte
+	if header[0] != MagicByte {
+		return nil, fmt.Errorf("magic byte inválido no offset %d", offset)
+	}
+
+	// Extrair payloadSize do header
+	payloadSize := binary.BigEndian.Uint32(header[14:18])
+	if payloadSize > 100*1024*1024 { // Sanity check: max 100MB
+		return nil, fmt.Errorf("payload size absurdo: %d", payloadSize)
+	}
+
+	// Ler payload (logo após o header)
+	payload := make([]byte, payloadSize)
+	if _, err := db.storageFile.ReadAt(payload, offset+HeaderSize); err != nil {
+		return nil, fmt.Errorf("falha ao ler payload: %v", err)
+	}
+
+	return payload, nil
+}
+
+// Stats retorna estatísticas do YodaDB incluindo o índice KyberDB
+type YodaStats struct {
+	Ingested    uint64
+	KyberKeys   uint64
+	KyberPages  uint64
+	KyberDepth  uint64
+	StorageSize int64
+	BloomSize   int64
+}
+
+func (db *YodaDB) Stats() (*YodaStats, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	stats := &YodaStats{
+		Ingested: db.Ingested,
+	}
+
+	if db.storageFile != nil {
+		if fi, err := db.storageFile.Stat(); err == nil {
+			stats.StorageSize = fi.Size()
+		}
+	}
+
+	if db.bloomFile != nil {
+		if fi, err := db.bloomFile.Stat(); err == nil {
+			stats.BloomSize = fi.Size()
+		}
+	}
+
+	if db.kyberDB != nil {
+		if ks, err := db.kyberDB.Stats(); err == nil {
+			stats.KyberKeys = ks.NumKeys
+			stats.KyberPages = ks.NumPages
+			stats.KyberDepth = ks.Depth
+		}
+	}
+
+	return stats, nil
+}
+
+func (db *YodaDB) Close() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.writeBuffer != nil {
+		db.writeBuffer.Flush()
+	}
+	// NOVO: Fechar KyberDB primeiro
+	if db.kyberDB != nil {
+		db.kyberDB.Close()
+	}
+	if db.BloomFilter != nil {
+		syscall.Munmap(db.BloomFilter)
+	}
+	if db.bloomFile != nil {
+		db.bloomFile.Close()
+	}
+	if db.storageFile != nil {
+		db.storageFile.Close()
+	}
+	if db.lockFile != nil {
+		syscall.Flock(int(db.lockFile.Fd()), syscall.LOCK_UN)
+		db.lockFile.Close()
+	}
+}
+
+// WriteRecordWithCompression grava com compressão
+func (db *YodaDB) WriteRecordWithCompression(workerID uint32, healthScore uint8, payload []byte) error {
+	compressed, finalHealth := compressPayload(payload, healthScore)
+	return db.WriteRecord(workerID, finalHealth, compressed)
+}
+
+// IngestStream lê TSV do stdin e ingere no YodaDB com indexação automática
+// Cada linha TSV é um registro; a primeira coluna é a chave para a B-tree
+func (db *YodaDB) IngestStream(workerID uint32) error {
+	scanner := bufio.NewScanner(os.Stdin)
+	// Buffer maior para linhas longas (até 1MB)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	
+	count := 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		
+		// Inserir como payload (healthScore = 100 por padrão)
+		if err := db.WriteRecord(workerID, 100, line); err != nil {
+			return fmt.Errorf("falha ao gravar linha %d: %v", count, err)
+		}
+		count++
+		
+		// Progresso a cada 10k registros
+		if count%10000 == 0 {
+			fmt.Fprintf(os.Stderr, "   ... %d registros ingeridos\n", count)
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("erro ao ler stdin: %v", err)
+	}
+	
+	fmt.Fprintf(os.Stderr, "✅ %d registros ingeridos com sucesso\n", count)
+	return nil
+}

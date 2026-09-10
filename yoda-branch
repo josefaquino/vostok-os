@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -e
+
+STORAGE="yoda_storage.log"
+KYBER="yoda_storage.log.kyber"
+WAL="yoda_storage.log.kyber.wal"
+BRANCH_DIR=".yoda-branches"
+CURRENT_FILE="$BRANCH_DIR/.current"
+
+init_branches() {
+    mkdir -p "$BRANCH_DIR"
+    if [ ! -f "$CURRENT_FILE" ]; then
+        echo "main" > "$CURRENT_FILE"
+    fi
+    # Criar snapshot do main se não existe
+    if [ ! -d "$BRANCH_DIR/main" ] && [ -f "$STORAGE" ]; then
+        mkdir -p "$BRANCH_DIR/main"
+        cp "$STORAGE" "$BRANCH_DIR/main/storage.log"
+        [ -f "$KYBER" ] && cp "$KYBER" "$BRANCH_DIR/main/storage.log.kyber"
+        [ -f "$WAL" ] && cp "$WAL" "$BRANCH_DIR/main/storage.log.kyber.wal"
+    fi
+}
+
+snapshot_current() {
+    local name="$1"
+    mkdir -p "$BRANCH_DIR/$name"
+    [ -f "$STORAGE" ] && cp "$STORAGE" "$BRANCH_DIR/$name/storage.log"
+    [ -f "$KYBER" ] && cp "$KYBER" "$BRANCH_DIR/$name/storage.log.kyber"
+    [ -f "$WAL" ] && cp "$WAL" "$BRANCH_DIR/$name/storage.log.kyber.wal"
+}
+
+restore_branch() {
+    local name="$1"
+    if [ -f "$BRANCH_DIR/$name/storage.log" ]; then
+        cp "$BRANCH_DIR/$name/storage.log" "$STORAGE"
+        [ -f "$BRANCH_DIR/$name/storage.log.kyber" ] && cp "$BRANCH_DIR/$name/storage.log.kyber" "$KYBER"
+        [ -f "$BRANCH_DIR/$name/storage.log.kyber.wal" ] && cp "$BRANCH_DIR/$name/storage.log.kyber.wal" "$WAL"
+    fi
+}
+
+cmd_create() {
+    local name="${1:?Uso: yoda-branch create <name>}"
+    init_branches
+    if [ -d "$BRANCH_DIR/$name" ]; then
+        echo "Branch ja existe: $name"; return 1
+    fi
+    snapshot_current "$name"
+    echo "Branch criado: $name"
+}
+
+cmd_list() {
+    init_branches
+    local current
+    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "main")
+    echo "======================================"
+    echo "BRANCHES"
+    echo "======================================"
+    for dir in "$BRANCH_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        local name
+        name=$(basename "$dir")
+        local marker=""
+        [ "$name" = "$current" ] && marker=" <- atual"
+        local size="?"
+        [ -f "$dir/storage.log" ] && size=$(stat -c%s "$dir/storage.log")
+        echo "   $name ($size bytes)$marker"
+    done
+    echo "======================================"
+}
+
+cmd_checkout() {
+    local name="${1:?Uso: yoda-branch checkout <name>}"
+    init_branches
+    local current
+    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "main")
+    if [ "$name" = "$current" ]; then
+        echo "Ja esta no branch: $name"; return 0
+    fi
+    # Salvar estado atual
+    snapshot_current "$current"
+    # Verificar destino
+    if [ ! -d "$BRANCH_DIR/$name" ]; then
+        echo "Branch nao existe: $name"; return 1
+    fi
+    # Restaurar destino
+    restore_branch "$name"
+    echo "$name" > "$CURRENT_FILE"
+    echo "Checkout: $name"
+}
+
+cmd_delete() {
+    local name="${1:?Uso: yoda-branch delete <name>}"
+    init_branches
+    if [ "$name" = "main" ]; then
+        echo "Nao pode deletar main"; return 1
+    fi
+    if [ ! -d "$BRANCH_DIR/$name" ]; then
+        echo "Branch nao existe: $name"; return 1
+    fi
+    rm -rf "$BRANCH_DIR/$name"
+    echo "Branch deletado: $name"
+}
+
+cmd_status() {
+    init_branches
+    local current
+    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "main")
+    echo "======================================"
+    echo "STATUS"
+    echo "======================================"
+    echo "   Branch atual: $current"
+    [ -f "$STORAGE" ] && echo "   Storage size: $(stat -c%s "$STORAGE") bytes"
+    local count
+    count=$(find "$BRANCH_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    echo "   Total branches: $count"
+    echo "======================================"
+}
+
+case "${1:-}" in
+    create)   cmd_create "${2:-}" ;;
+    list)     cmd_list ;;
+    checkout) cmd_checkout "${2:-}" ;;
+    delete)   cmd_delete "${2:-}" ;;
+    status)   cmd_status ;;
+    *)
+        echo "Uso:"
+        echo "  ./yoda-branch create <name>"
+        echo "  ./yoda-branch list"
+        echo "  ./yoda-branch checkout <name>"
+        echo "  ./yoda-branch delete <name>"
+        echo "  ./yoda-branch status"
+        ;;
+esac

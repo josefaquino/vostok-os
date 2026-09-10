@@ -1,0 +1,791 @@
+#define _POSIX_C_SOURCE 200809L
+#include "kyber_btree.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+#define BTREE_PAGE_SIZE KYBER_BTREE_PAGE_SIZE
+#define BTREE_MAX_KEYS 128
+#define BTREE_MAX_DEPTH 64
+
+/* ═══════════════════════════════════════════════════════════════════
+   ESTRUTURAS INTERNAS (baseadas em btree_page_t de 4096 bytes)
+   ═══════════════════════════════════════════════════════════════════ */
+typedef struct {
+    uint32_t pgno;
+    uint32_t level;
+    uint32_t n_entries;
+    uint32_t parent_pgno;
+    uint32_t rightmost_child;
+    char data[BTREE_PAGE_SIZE - 20];
+} btree_page_t;
+
+struct KyberBTree {
+    int fd;
+    uint32_t root_pgno;
+    uint32_t num_pages;
+    char path[1024];
+    bool use_wal;
+    int wal_fd;
+    bool in_transaction;
+    char last_error[256];
+};
+
+struct KyberBTreeIter {
+    KyberBTree *t;
+    uint32_t *path_pgnos;   /* caminho da raiz até folha atual */
+    uint32_t *path_pos;     /* posição em cada nível */
+    uint32_t depth;
+    uint32_t cap;
+    bool done;
+};
+
+static char g_last_error[256] = "no error";
+
+/* ═══════════════════════════════════════════════════════════════════
+   LEITURAS/ESCRITAS ALINHADAS (prevenção de UB)
+   ═══════════════════════════════════════════════════════════════════ */
+static inline uint32_t read_u32(const void* p) {
+    uint32_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+static inline void write_u32(void* p, uint32_t v) {
+    memcpy(p, &v, sizeof(v));
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   I/O DE PÁGINAS
+   ═══════════════════════════════════════════════════════════════════ */
+static btree_page_t* page_read(KyberBTree* t, uint32_t pgno) {
+    if (pgno >= t->num_pages) return NULL;
+    btree_page_t* p = malloc(BTREE_PAGE_SIZE);
+    if (!p) return NULL;
+    off_t off = (off_t)pgno * BTREE_PAGE_SIZE;
+    if (pread(t->fd, p, BTREE_PAGE_SIZE, off) != BTREE_PAGE_SIZE) {
+        free(p); return NULL;
+    }
+    return p;
+}
+
+static int page_write(KyberBTree* t, btree_page_t* p) {
+    off_t off = (off_t)p->pgno * BTREE_PAGE_SIZE;
+    if (pwrite(t->fd, p, BTREE_PAGE_SIZE, off) != BTREE_PAGE_SIZE) return -EIO;
+    return 0;
+}
+
+static uint32_t page_new(KyberBTree* t) {
+    return t->num_pages++;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   CÁLCULO DE TAMANHO DE ENTRADA
+   ═══════════════════════════════════════════════════════════════════ */
+static uint32_t entry_size(uint32_t klen, uint32_t vlen) {
+    return 8 + klen + vlen + 4;
+}
+
+static uint32_t entry_offset(btree_page_t* p, uint32_t idx) {
+    char* data = p->data;
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < idx; i++) {
+        uint32_t k = read_u32(data + off);
+        uint32_t v = read_u32(data + off + 4);
+        off += 8 + k + v + 4;
+    }
+    return off;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   EXTRAÇÃO DE ENTRADA
+   ═══════════════════════════════════════════════════════════════════ */
+static void entry_extract(btree_page_t* p, uint32_t pos,
+                          void** key, uint32_t* klen,
+                          void** val, uint32_t* vlen,
+                          uint32_t* child) {
+    char* data = p->data;
+    uint32_t off = entry_offset(p, pos);
+    uint32_t k = read_u32(data + off);
+    uint32_t v = read_u32(data + off + 4);
+    if (klen) *klen = k;
+    if (vlen) *vlen = v;
+    if (key) *key = data + off + 8;
+    if (val) *val = data + off + 8 + k;
+    if (child) *child = read_u32(data + off + 8 + k + v);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   INSERÇÃO DE ENTRADA EM POSIÇÃO ESPECÍFICA
+   ═══════════════════════════════════════════════════════════════════ */
+static void entry_insert_at(btree_page_t* p, uint32_t pos,
+                            const void* key, uint32_t klen,
+                            const void* val, uint32_t vlen,
+                            uint32_t child) {
+    char* data = p->data;
+    uint32_t esz = entry_size(klen, vlen);
+    uint32_t off = entry_offset(p, pos);
+    uint32_t total = entry_offset(p, p->n_entries);
+    uint32_t move = total - off;
+    if (move > 0) memmove(data + off + esz, data + off, move);
+
+    write_u32(data + off, klen);
+    write_u32(data + off + 4, vlen);
+    memcpy(data + off + 8, key, klen);
+    if (val && vlen > 0) memcpy(data + off + 8 + klen, val, vlen);
+    write_u32(data + off + 8 + klen + vlen, child);
+    p->n_entries++;
+}
+
+static void update_child_at(btree_page_t* p, uint32_t pos, uint32_t new_child) {
+    char* data = p->data;
+    uint32_t off = entry_offset(p, pos);
+    uint32_t k = read_u32(data + off);
+    uint32_t v = read_u32(data + off + 4);
+    write_u32(data + off + 8 + k + v, new_child);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   BUSCA NA PÁGINA (linear)
+   ═══════════════════════════════════════════════════════════════════ */
+static int page_find(btree_page_t* p, const void* key, size_t klen,
+                     uint32_t* pos, uint32_t* child) {
+    char* data = p->data;
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < p->n_entries; i++) {
+        uint32_t k = read_u32(data + off);
+        uint32_t v = read_u32(data + off + 4);
+        uint32_t ch = read_u32(data + off + 8 + k + v);
+
+        int cmp;
+        size_t min_len = (k < klen) ? k : klen;
+        cmp = memcmp(data + off + 8, key, min_len);
+        if (cmp == 0) {
+            if (k < klen) cmp = -1;
+            else if (k > klen) cmp = 1;
+        }
+
+        if (cmp == 0) { *pos = i; *child = ch; return 1; }
+        if (cmp > 0)  { *pos = i; *child = ch; return 0; }
+        off += 8 + k + v + 4;
+    }
+    *pos = p->n_entries;
+    *child = p->rightmost_child;
+    return 0;
+}
+
+static int page_can_fit(btree_page_t* p, uint32_t klen, uint32_t vlen) {
+    uint32_t total = entry_offset(p, p->n_entries);
+    uint32_t need = entry_size(klen, vlen);
+    return (total + need <= sizeof(p->data)) ? 1 : 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SPLIT E INSERÇÃO (algoritmo do R2-Kyber, adaptado)
+   ═══════════════════════════════════════════════════════════════════ */
+static int split_and_insert(KyberBTree* t, uint32_t pgno,
+                            const void* key, uint32_t klen,
+                            const void* val, uint32_t vlen,
+                            uint32_t child_pgno,
+                            uint32_t* out_prom_pgno,
+                            void** out_prom_key, uint32_t* out_prom_klen) {
+    btree_page_t* p = page_read(t, pgno);
+    if (!p) return -EIO;
+
+    /* Buffer temporário para todas as entradas + a nova */
+    char* temp = malloc(BTREE_PAGE_SIZE * 2);
+    if (!temp) { free(p); return -ENOMEM; }
+    memset(temp, 0, BTREE_PAGE_SIZE * 2);
+
+    uint32_t pos, dummy;
+    page_find(p, key, klen, &pos, &dummy);
+
+    char* src = p->data;
+    uint32_t toff = 0, soff = 0;
+    uint32_t temp_rightmost = p->rightmost_child;
+
+    for (uint32_t i = 0; i < p->n_entries; i++) {
+        uint32_t k = read_u32(src + soff);
+        uint32_t v = read_u32(src + soff + 4);
+        uint32_t ch = read_u32(src + soff + 8 + k + v);
+        uint32_t esz = 8 + k + v + 4;
+
+        if (i == pos) {
+            /* Insere a nova entrada ANTES da existente */
+            write_u32(temp + toff, klen);
+            write_u32(temp + toff + 4, vlen);
+            memcpy(temp + toff + 8, key, klen);
+            if (val && vlen > 0) memcpy(temp + toff + 8 + klen, val, vlen);
+            write_u32(temp + toff + 8 + klen + vlen, child_pgno);
+            toff += 8 + klen + vlen + 4;
+
+            /* Copia entrada original com child_pgno original */
+            write_u32(temp + toff, k);
+            write_u32(temp + toff + 4, v);
+            memcpy(temp + toff + 8, src + soff + 8, k + v);
+            write_u32(temp + toff + 8 + k + v, ch);
+            toff += esz;
+        } else {
+            memcpy(temp + toff, src + soff, esz);
+            toff += esz;
+        }
+        soff += esz;
+    }
+    if (pos == p->n_entries) {
+        write_u32(temp + toff, klen);
+        write_u32(temp + toff + 4, vlen);
+        memcpy(temp + toff + 8, key, klen);
+        if (val && vlen > 0) memcpy(temp + toff + 8 + klen, val, vlen);
+        write_u32(temp + toff + 8 + klen + vlen, temp_rightmost);
+        toff += 8 + klen + vlen + 4;
+        temp_rightmost = child_pgno;
+    }
+
+    uint32_t total = p->n_entries + 1;
+    uint32_t new_pgno = page_new(t);
+    btree_page_t* np = calloc(1, BTREE_PAGE_SIZE);
+    if (!np) { free(p); free(temp); return -ENOMEM; }
+    np->pgno = new_pgno;
+    np->level = p->level;
+    np->parent_pgno = p->parent_pgno;
+
+    uint32_t half = total / 2;
+
+    /* Limpa páginas */
+    memset(p->data, 0, sizeof(p->data));
+    p->n_entries = 0;
+
+    if (p->level == 0) {
+        /* ═══ SPLIT DE FOLHA ═══ */
+        uint32_t off = 0;
+        for (uint32_t i = 0; i < half; i++) {
+            uint32_t k = read_u32(temp + off);
+            uint32_t v = read_u32(temp + off + 4);
+            uint32_t esz = 8 + k + v + 4;
+            memcpy(p->data + entry_offset(p, p->n_entries), temp + off, esz);
+            p->n_entries++;
+            off += esz;
+        }
+        for (uint32_t i = half; i < total; i++) {
+            uint32_t k = read_u32(temp + off);
+            uint32_t v = read_u32(temp + off + 4);
+            uint32_t esz = 8 + k + v + 4;
+            memcpy(np->data + entry_offset(np, np->n_entries), temp + off, esz);
+            np->n_entries++;
+            off += esz;
+        }
+
+        /* Promove primeira chave de np */
+        uint32_t pk = read_u32(np->data);
+        *out_prom_klen = pk;
+        *out_prom_key = malloc(pk);
+        if (!*out_prom_key) { free(p); free(np); free(temp); return -ENOMEM; }
+        memcpy(*out_prom_key, np->data + 8, pk);
+        *out_prom_pgno = new_pgno;
+    } else {
+        /* ═══ SPLIT DE PÁGINA INTERNA ═══ */
+        uint32_t off = 0;
+        for (uint32_t i = 0; i < half; i++) {
+            uint32_t k = read_u32(temp + off);
+            uint32_t v = read_u32(temp + off + 4);
+            uint32_t esz = 8 + k + v + 4;
+            memcpy(p->data + entry_offset(p, p->n_entries), temp + off, esz);
+            p->n_entries++;
+            off += esz;
+        }
+
+        /* Entrada a ser promovida */
+        uint32_t pk = read_u32(temp + off);
+        uint32_t pv = read_u32(temp + off + 4);
+        uint32_t pch = read_u32(temp + off + 8 + pk + pv);
+
+        *out_prom_klen = pk;
+        *out_prom_key = malloc(pk);
+        if (!*out_prom_key) { free(p); free(np); free(temp); return -ENOMEM; }
+        memcpy(*out_prom_key, temp + off + 8, pk);
+        *out_prom_pgno = new_pgno;
+
+        p->rightmost_child = pch;
+        off += 8 + pk + pv + 4;
+
+        np->rightmost_child = temp_rightmost;
+        for (uint32_t i = half + 1; i < total; i++) {
+            uint32_t k = read_u32(temp + off);
+            uint32_t v = read_u32(temp + off + 4);
+            uint32_t esz = 8 + k + v + 4;
+            memcpy(np->data + entry_offset(np, np->n_entries), temp + off, esz);
+            np->n_entries++;
+            off += esz;
+        }
+    }
+
+    page_write(t, p);
+    page_write(t, np);
+    free(p); free(np); free(temp);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   INSERÇÃO EM FOLHA COM PROPAGAÇÃO DE SPLIT (iterativa)
+   ═══════════════════════════════════════════════════════════════════ */
+static int insert_into_leaf(KyberBTree* t, uint32_t pgno,
+                            const void* key, uint32_t klen,
+                            const void* val, uint32_t vlen,
+                            uint32_t* path, int path_depth) {
+    btree_page_t* p = page_read(t, pgno);
+    if (!p) return -EIO;
+
+    if (page_can_fit(p, klen, vlen)) {
+        uint32_t pos, dummy;
+        page_find(p, key, klen, &pos, &dummy);
+        entry_insert_at(p, pos, key, klen, val, vlen, 0);
+        int ret = page_write(t, p);
+        free(p);
+        return ret;
+    }
+    free(p);
+
+    /* Split necessário */
+    uint32_t prom_pgno = 0;
+    void* prom_key = NULL;
+    uint32_t prom_klen = 0;
+
+    int ret = split_and_insert(t, pgno, key, klen, val, vlen, 0,
+                               &prom_pgno, &prom_key, &prom_klen);
+    if (ret != 0) return ret;
+
+    /* Propagação iterativa para cima */
+    int depth = path_depth - 1;
+    while (depth >= 0) {
+        uint32_t parent_pgno = path[depth];
+        btree_page_t* parent = page_read(t, parent_pgno);
+        if (!parent) { free(prom_key); return -EIO; }
+
+        if (page_can_fit(parent, prom_klen, 0)) {
+            uint32_t pos, dummy;
+            page_find(parent, prom_key, prom_klen, &pos, &dummy);
+
+            if (pos < parent->n_entries) {
+                uint32_t orig_child;
+                entry_extract(parent, pos, NULL, NULL, NULL, NULL, &orig_child);
+                entry_insert_at(parent, pos, prom_key, prom_klen, NULL, 0, orig_child);
+                update_child_at(parent, pos + 1, prom_pgno);
+            } else {
+                uint32_t orig_right = parent->rightmost_child;
+                entry_insert_at(parent, pos, prom_key, prom_klen, NULL, 0, orig_right);
+                parent->rightmost_child = prom_pgno;
+            }
+
+            page_write(t, parent);
+            free(parent);
+            free(prom_key);
+            return 0;
+        }
+
+        /* Pai cheio: split do pai também */
+        uint32_t np_pgno = 0;
+        void* np_key = NULL;
+        uint32_t np_klen = 0;
+
+        ret = split_and_insert(t, parent_pgno, prom_key, prom_klen, NULL, 0,
+                               prom_pgno, &np_pgno, &np_key, &np_klen);
+        free(parent);
+        free(prom_key);
+        if (ret != 0) return ret;
+
+        prom_pgno = np_pgno;
+        prom_key = np_key;
+        prom_klen = np_klen;
+        depth--;
+    }
+
+    /* Raiz estourou: criar nova raiz */
+    uint32_t root_pgno = page_new(t);
+    btree_page_t* root = calloc(1, BTREE_PAGE_SIZE);
+    if (!root) { free(prom_key); return -ENOMEM; }
+    root->pgno = root_pgno;
+
+    btree_page_t* old_root = page_read(t, t->root_pgno);
+    if (old_root) {
+        root->level = old_root->level + 1;
+        free(old_root);
+    } else {
+        root->level = 1;
+    }
+    root->parent_pgno = 0;
+    root->rightmost_child = prom_pgno;
+
+    entry_insert_at(root, 0, prom_key, prom_klen, NULL, 0, t->root_pgno);
+    page_write(t, root);
+
+    /* Ajusta parentais dos filhos */
+    btree_page_t* lc = page_read(t, t->root_pgno);
+    if (lc) { lc->parent_pgno = root_pgno; page_write(t, lc); free(lc); }
+    btree_page_t* rc = page_read(t, prom_pgno);
+    if (rc) { rc->parent_pgno = root_pgno; page_write(t, rc); free(rc); }
+
+    t->root_pgno = root_pgno;
+    free(root);
+    free(prom_key);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   API PÚBLICA (contrato kyber_btree.h)
+   ═══════════════════════════════════════════════════════════════════ */
+KyberBTree* kyber_btree_open(const char* path, const KyberBTreeConfig* cfg) {
+    if (!path) return NULL;
+    KyberBTree* t = calloc(1, sizeof(KyberBTree));
+    if (!t) return NULL;
+    strncpy(t->path, path, sizeof(t->path) - 1);
+
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) { free(t); return NULL; }
+    t->fd = fd;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); free(t); return NULL; }
+
+    t->use_wal = cfg ? cfg->use_wal : false;
+
+    if (st.st_size == 0) {
+        t->root_pgno = 0;
+        t->num_pages = 1;
+        btree_page_t* root = calloc(1, BTREE_PAGE_SIZE);
+        if (!root) { close(fd); free(t); return NULL; }
+        root->pgno = 0;
+        root->level = 0;
+        root->n_entries = 0;
+        root->rightmost_child = 0;
+        if (page_write(t, root) != 0) {
+            free(root); close(fd); free(t); return NULL;
+        }
+        free(root);
+    } else {
+        t->num_pages = (uint32_t)(st.st_size / BTREE_PAGE_SIZE);
+        if (t->num_pages == 0) t->num_pages = 1;
+        btree_page_t* root = page_read(t, 0);
+        if (!root) { close(fd); free(t); return NULL; }
+        t->root_pgno = root->pgno;
+        free(root);
+    }
+
+    if (t->use_wal) {
+        char wp[1100];
+        snprintf(wp, sizeof wp, "%s.wal", path);
+        t->wal_fd = open(wp, O_RDWR | O_CREAT | O_APPEND, 0644);
+    }
+    return t;
+}
+
+void kyber_btree_close(KyberBTree* t) {
+    if (!t) return;
+    if (t->fd > 0) close(t->fd);
+    if (t->wal_fd > 0) close(t->wal_fd);
+    free(t);
+}
+
+bool kyber_btree_put(KyberBTree* t, const void* key, size_t klen,
+                     const void* val, size_t vlen) {
+    if (!t || !key || klen == 0) return false;
+
+    /* Log no WAL (best-effort) */
+    if (t->use_wal && t->wal_fd > 0) {
+        uint8_t op = 1;
+        uint32_t kl = (uint32_t)klen, vl = (uint32_t)vlen;
+        write(t->wal_fd, &op, 1);
+        write(t->wal_fd, &kl, 4);
+        write(t->wal_fd, &vl, 4);
+        write(t->wal_fd, key, klen);
+        if (val && vl) write(t->wal_fd, val, vl);
+        fsync(t->wal_fd);
+    }
+
+    /* Descer da raiz até a folha, registrando o caminho (CORREÇÃO R2-Kyber #1) */
+    uint32_t pgno = t->root_pgno;
+    uint32_t path_pgnos[BTREE_MAX_DEPTH];  /* ← CORREÇÃO: era uint32_t path_pgnos; */
+    int path_depth = 0;
+
+    while (1) {
+        btree_page_t* p = page_read(t, pgno);
+        if (!p) {
+            snprintf(t->last_error, sizeof t->last_error, "page read failed");
+            return false;
+        }
+        if (p->level == 0) { free(p); break; }
+        if (path_depth >= BTREE_MAX_DEPTH) {
+            free(p);
+            snprintf(t->last_error, sizeof t->last_error, "tree too deep");
+            return false;
+        }
+        path_pgnos[path_depth++] = pgno;
+
+        uint32_t pos, child_pgno;
+        page_find(p, key, klen, &pos, &child_pgno);
+        pgno = child_pgno;
+        free(p);
+    }
+
+    int ret = insert_into_leaf(t, pgno, key, (uint32_t)klen,
+                               val, (uint32_t)vlen,
+                               path_pgnos, path_depth);
+    if (ret != 0) {
+        snprintf(t->last_error, sizeof t->last_error, "insert failed: %d", ret);
+        return false;
+    }
+    return true;
+}
+
+bool kyber_btree_get(KyberBTree* t, const void* key, size_t klen,
+                     void** val, size_t* vlen) {
+    if (!t || !key || klen == 0 || !val || !vlen) return false;
+    uint32_t pgno = t->root_pgno;
+    while (1) {
+        btree_page_t* p = page_read(t, pgno);
+        if (!p) {
+            snprintf(t->last_error, sizeof t->last_error, "page read failed");
+            return false;
+        }
+        uint32_t pos, child;
+        int found = page_find(p, key, klen, &pos, &child);
+
+        if (found && p->level == 0) {
+            /* Encontrou na FOLHA: extrair valor */
+            uint32_t k, v;
+            void *kp, *vp;
+            entry_extract(p, pos, &kp, &k, &vp, &v, NULL);
+            *vlen = v;
+            if (v > 0) {
+                *val = malloc(v);
+                if (!*val) { free(p); return false; }
+                memcpy(*val, vp, v);
+            } else {
+                *val = NULL;
+            }
+            free(p);
+            return true;
+        }
+
+        if (p->level == 0) {
+            /* Não encontrou na folha */
+            free(p);
+            snprintf(t->last_error, sizeof t->last_error, "key not found");
+            return false;
+        }
+
+        /* Nó interno: descer para o filho apropriado */
+        if (found) {
+            /* Encontrou a chave SEPARADORA em nó interno.
+             * Precisamos descer pelo filho à DIREITA da entrada,
+             * pois a chave separadora indica que valores >= ela
+             * estão no filho direito. */
+            if (pos + 1 < p->n_entries) {
+                uint32_t k2, v2;
+                entry_extract(p, pos + 1, NULL, &k2, NULL, &v2, &child);
+            } else {
+                child = p->rightmost_child;
+            }
+        }
+        /* Se não found, child já está correto (filho à esquerda da próxima entrada) */
+
+        if (child >= t->num_pages) {
+            free(p);
+            snprintf(t->last_error, sizeof t->last_error, "invalid child %u", child);
+            return false;
+        }
+        pgno = child;
+        free(p);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   DELETE (implementação simples: remove da folha)
+   Nota: não faz rebalanceamento (merge/redistribute). Para o contrato
+   de 10k chaves isso é aceitável; otimização futura.
+   ═══════════════════════════════════════════════════════════════════ */
+static void entry_remove_at(btree_page_t* p, uint32_t pos) {
+    char* data = p->data;
+    uint32_t off = entry_offset(p, pos);
+    uint32_t k = read_u32(data + off);
+    uint32_t v = read_u32(data + off + 4);
+    uint32_t esz = 8 + k + v + 4;
+    uint32_t total = entry_offset(p, p->n_entries);
+    memmove(data + off, data + off + esz, total - off - esz);
+    memset(data + total - esz, 0, esz);
+    p->n_entries--;
+}
+
+bool kyber_btree_delete(KyberBTree* t, const void* key, size_t klen) {
+    if (!t || !key || klen == 0) return false;
+
+    if (t->use_wal && t->wal_fd > 0) {
+        uint8_t op = 2;
+        uint32_t kl = (uint32_t)klen;
+        write(t->wal_fd, &op, 1);
+        write(t->wal_fd, &kl, 4);
+        write(t->wal_fd, key, klen);
+        fsync(t->wal_fd);
+    }
+
+    uint32_t pgno = t->root_pgno;
+    while (1) {
+        btree_page_t* p = page_read(t, pgno);
+        if (!p) return false;
+        uint32_t pos, child;
+        int found = page_find(p, key, klen, &pos, &child);
+
+        if (found && p->level == 0) {
+            /* Encontrou na FOLHA: remover */
+            entry_remove_at(p, pos);
+            page_write(t, p);
+            free(p);
+            return true;
+        }
+
+        if (p->level == 0) {
+            /* Não encontrou na folha */
+            free(p);
+            snprintf(t->last_error, sizeof t->last_error, "key not found");
+            return false;
+        }
+
+        /* Nó interno: descer para o filho apropriado */
+        if (found) {
+            /* Encontrou a chave SEPARADORA em nó interno.
+             * Descer pelo filho à DIREITA da entrada. */
+            if (pos + 1 < p->n_entries) {
+                uint32_t k2, v2;
+                entry_extract(p, pos + 1, NULL, &k2, NULL, &v2, &child);
+            } else {
+                child = p->rightmost_child;
+            }
+        }
+
+        if (child >= t->num_pages) {
+            free(p);
+            snprintf(t->last_error, sizeof t->last_error, "invalid child %u", child);
+            return false;
+        }
+        pgno = child;
+        free(p);
+    }
+}
+
+bool kyber_btree_begin(KyberBTree* t) { if (!t) return false; t->in_transaction = true; return true; }
+bool kyber_btree_commit(KyberBTree* t) { if (!t) return false; t->in_transaction = false; return true; }
+void kyber_btree_abort(KyberBTree* t) { if (t) t->in_transaction = false; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   STATS
+   ═══════════════════════════════════════════════════════════════════ */
+bool kyber_btree_stats(KyberBTree* t, KyberBTreeStats* out) {
+    if (!t || !out) return false;
+    memset(out, 0, sizeof(*out));
+    out->num_pages = t->num_pages;
+    out->file_size = (uint64_t)t->num_pages * BTREE_PAGE_SIZE;
+
+    /* Contar chaves e medir profundidade percorrendo todas as páginas */
+    uint64_t keys = 0;
+    uint32_t max_level = 0;
+    for (uint32_t i = 0; i < t->num_pages; i++) {
+        btree_page_t* p = page_read(t, i);
+        if (!p) continue;
+        if (p->level == 0) keys += p->n_entries;
+        if (p->level > max_level) max_level = p->level;
+        free(p);
+    }
+    out->num_keys = keys;
+    out->depth = max_level + 1;
+    return true;
+}
+
+const char* kyber_btree_last_error(void) { return g_last_error; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   ITERADOR (DFS em ordem)
+   ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════
+   ITERADOR (percorre todas as folhas)
+   Usa path_pgnos[0] como current_pgno e path_pos[0] como current_pos
+   ═══════════════════════════════════════════════════════════════════ */
+KyberBTreeIter* kyber_btree_iter_open(KyberBTree* t) {
+    if (!t) return NULL;
+    KyberBTreeIter* it = calloc(1, sizeof(KyberBTreeIter));
+    if (!it) return NULL;
+    it->t = t;
+    it->cap = 1;
+    it->path_pgnos = calloc(1, sizeof(uint32_t));
+    it->path_pos = calloc(1, sizeof(uint32_t));
+    if (!it->path_pgnos || !it->path_pos) {
+        free(it->path_pgnos);
+        free(it->path_pos);
+        free(it);
+        return NULL;
+    }
+    it->path_pgnos[0] = 0;  /* current_pgno */
+    it->path_pos[0] = 0;    /* current_pos */
+    it->depth = 1;
+    it->done = false;
+    return it;
+}
+
+bool kyber_btree_iter_next(KyberBTreeIter* it,
+                           const void** key, size_t* klen,
+                           const void** val, size_t* vlen) {
+    if (!it || it->done) return false;
+
+    uint32_t current_pgno = it->path_pgnos[0];
+    uint32_t current_pos = it->path_pos[0];
+
+    while (current_pgno < it->t->num_pages) {
+        btree_page_t* p = page_read(it->t, current_pgno);
+        if (!p) {
+            current_pgno++;
+            current_pos = 0;
+            continue;
+        }
+
+        if (p->level != 0) {
+            /* Não é folha, pular */
+            free(p);
+            current_pgno++;
+            current_pos = 0;
+            continue;
+        }
+
+        if (current_pos < p->n_entries) {
+            /* Retornar esta entrada */
+            uint32_t k, v;
+            void *kp, *vp;
+            entry_extract(p, current_pos, &kp, &k, &vp, &v, NULL);
+            *key = kp;
+            *klen = k;
+            *val = vp;
+            *vlen = v;
+            current_pos++;
+            it->path_pgnos[0] = current_pgno;
+            it->path_pos[0] = current_pos;
+            free(p);
+            return true;
+        }
+
+        /* Página esgotada, ir para a próxima */
+        free(p);
+        current_pgno++;
+        current_pos = 0;
+        it->path_pgnos[0] = current_pgno;
+        it->path_pos[0] = current_pos;
+    }
+
+    it->done = true;
+    return false;
+}
+
+void kyber_btree_iter_close(KyberBTreeIter* it) {
+    if (!it) return;
+    free(it->path_pgnos);
+    free(it->path_pos);
+    free(it);
+}

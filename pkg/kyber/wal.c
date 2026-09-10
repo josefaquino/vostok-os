@@ -1,0 +1,252 @@
+#define _POSIX_C_SOURCE 200809L
+
+/*
+ * wal.c - Write-Ahead Log para KyberDB
+ * 
+ * Design minimalista e correto:
+ * - Cada entrada: [length][crc32][op][key_len][key][value_len][value]
+ * - Replay na abertura para recuperar operações pendentes
+ * - Checkpoint trunca o WAL após aplicar
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include "wal.h"
+
+#define WAL_OP_PUT    0x01
+#define WAL_OP_DELETE 0x02
+#define WAL_MAGIC     0x57414C31  /* "WAL1" */
+
+/* CRC32 simples (não é o mais rápido, mas é correto) */
+static uint32_t crc32_table[256];
+static int crc32_initialized = 0;
+
+static void crc32_init(void) {
+    if (crc32_initialized) return;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++) {
+            c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+        }
+        crc32_table[i] = c;
+    }
+    crc32_initialized = 1;
+}
+
+static uint32_t crc32(const void *data, size_t len) {
+    crc32_init();
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/* Estrutura do WAL */
+struct WAL {
+    int fd;
+    char path[1024];
+    uint64_t entries_count;
+};
+
+/* Abrir/criar WAL */
+WAL* wal_open(const char *path) {
+    WAL *w = calloc(1, sizeof(WAL));
+    if (!w) return NULL;
+    
+    strncpy(w->path, path, sizeof(w->path) - 1);
+    w->fd = open(path, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (w->fd < 0) {
+        free(w);
+        return NULL;
+    }
+    
+    return w;
+}
+
+/* Fechar WAL */
+void wal_close(WAL *w) {
+    if (!w) return;
+    if (w->fd >= 0) {
+        fsync(w->fd);
+        close(w->fd);
+    }
+    free(w);
+}
+
+/* Adicionar entrada PUT ao WAL */
+int wal_append_put(WAL *w, const void *key, size_t key_len,
+                   const void *value, size_t value_len) {
+    if (!w || w->fd < 0) return -1;
+    
+    /* Calcular tamanho total da entrada */
+    uint32_t entry_len = 1 + 4 + key_len + 4 + value_len;
+    uint8_t *buf = malloc(entry_len);
+    if (!buf) return -1;
+    
+    /* Montar entrada: [op][key_len][key][value_len][value] */
+    size_t pos = 0;
+    buf[pos++] = WAL_OP_PUT;
+    
+    uint32_t kl = (uint32_t)key_len;
+    memcpy(buf + pos, &kl, 4); pos += 4;
+    
+    memcpy(buf + pos, key, key_len); pos += key_len;
+    
+    uint32_t vl = (uint32_t)value_len;
+    memcpy(buf + pos, &vl, 4); pos += 4;
+    
+    if (value_len > 0) {
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    }
+    
+    /* Calcular CRC */
+    uint32_t checksum = crc32(buf, entry_len);
+    
+    /* Escrever: [length][crc32][entry] */
+    uint32_t total_len = entry_len;
+    if (write(w->fd, &total_len, 4) != 4) { free(buf); return -1; }
+    if (write(w->fd, &checksum, 4) != 4) { free(buf); return -1; }
+    if (write(w->fd, buf, entry_len) != (ssize_t)entry_len) { free(buf); return -1; }
+    
+    free(buf);
+    w->entries_count++;
+    
+    
+    return 0;
+}
+
+/* Adicionar entrada DELETE ao WAL */
+int wal_append_delete(WAL *w, const void *key, size_t key_len) {
+    if (!w || w->fd < 0) return -1;
+    
+    uint32_t entry_len = 1 + 4 + key_len;
+    uint8_t *buf = malloc(entry_len);
+    if (!buf) return -1;
+    
+    size_t pos = 0;
+    buf[pos++] = WAL_OP_DELETE;
+    
+    uint32_t kl = (uint32_t)key_len;
+    memcpy(buf + pos, &kl, 4); pos += 4;
+    
+    memcpy(buf + pos, key, key_len); pos += key_len;
+    
+    uint32_t checksum = crc32(buf, entry_len);
+    
+    uint32_t total_len = entry_len;
+    if (write(w->fd, &total_len, 4) != 4) { free(buf); return -1; }
+    if (write(w->fd, &checksum, 4) != 4) { free(buf); return -1; }
+    if (write(w->fd, buf, entry_len) != (ssize_t)entry_len) { free(buf); return -1; }
+    
+    free(buf);
+    w->entries_count++;
+    
+    return 0;
+}
+
+/* Callback para replay */
+typedef int (*wal_replay_callback)(int op, const void *key, size_t key_len,
+                                   const void *value, size_t value_len, void *user);
+
+/* Replay do WAL - aplica operações pendentes */
+int wal_replay(WAL *w, wal_replay_callback cb, void *user) {
+    if (!w || w->fd < 0) return -1;
+    
+    /* Voltar ao início */
+    if (lseek(w->fd, 0, SEEK_SET) < 0) return -1;
+    
+    int applied = 0;
+    
+    while (1) {
+        /* Ler header da entrada */
+        uint32_t entry_len;
+        uint32_t checksum;
+        
+        ssize_t n = read(w->fd, &entry_len, 4);
+        if (n == 0) break;  /* EOF */
+        if (n != 4) break;  /* Entrada truncada */
+        
+        if (read(w->fd, &checksum, 4) != 4) break;
+        
+        /* Sanity check */
+        if (entry_len > 100 * 1024 * 1024) break;  /* Entrada absurda */
+        
+        /* Ler entrada */
+        uint8_t *buf = malloc(entry_len);
+        if (!buf) break;
+        
+        if (read(w->fd, buf, entry_len) != (ssize_t)entry_len) {
+            free(buf);
+            break;
+        }
+        
+        /* Verificar CRC */
+        uint32_t actual_crc = crc32(buf, entry_len);
+        if (actual_crc != checksum) {
+            free(buf);
+            break;  /* Entrada corrompida, parar replay */
+        }
+        
+        /* Parse da entrada */
+        uint8_t op = buf[0];
+        size_t pos = 1;
+        
+        if (op == WAL_OP_PUT) {
+            uint32_t key_len, value_len;
+            memcpy(&key_len, buf + pos, 4); pos += 4;
+            
+            const void *key = buf + pos;
+            pos += key_len;
+            
+            memcpy(&value_len, buf + pos, 4); pos += 4;
+            
+            const void *value = buf + pos;
+            
+            if (cb) {
+                cb(WAL_OP_PUT, key, key_len, value, value_len, user);
+            }
+            applied++;
+            
+        } else if (op == WAL_OP_DELETE) {
+            uint32_t key_len;
+            memcpy(&key_len, buf + pos, 4); pos += 4;
+            
+            const void *key = buf + pos;
+            
+            if (cb) {
+                cb(WAL_OP_DELETE, key, key_len, NULL, 0, user);
+            }
+            applied++;
+        }
+        
+        free(buf);
+    }
+    
+    return applied;
+}
+
+/* Checkpoint: trunca o WAL após replay bem-sucedido */
+int wal_checkpoint(WAL *w) {
+    if (!w || w->fd < 0) return -1;
+    
+    /* Truncar arquivo */
+    if (ftruncate(w->fd, 0) < 0) return -1;
+    
+    /* Voltar ao início */
+    if (lseek(w->fd, 0, SEEK_SET) < 0) return -1;
+    
+    w->entries_count = 0;
+    return 0;
+}
+
+/* Obter número de entradas pendentes */
+uint64_t wal_pending_count(WAL *w) {
+    return w ? w->entries_count : 0;
+}

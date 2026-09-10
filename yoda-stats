@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# ============================================================================
+# yoda-stats - Análise estatística via DuckDB (Unix puro)
+# Inspirado no rush do Jeroen Janssens, usando DuckDB como engine
+# ============================================================================
+
+set -e
+
+STORAGE="yoda_storage.log"
+TMP_PARQUET="/tmp/yoda_stats_$$.parquet"
+
+cleanup() { rm -f "$TMP_PARQUET"; }
+trap cleanup EXIT
+
+export_data() {
+    if [ ! -f "$STORAGE" ]; then
+        echo "❌ Storage não encontrado: $STORAGE"
+        exit 1
+    fi
+    ./yodadb-export "$STORAGE" "$TMP_PARQUET" >/dev/null 2>&1
+}
+
+cmd_stats() {
+    export_data
+    echo "════════════════════════════════════════"
+    echo "📊 ESTATÍSTICAS DESCRITIVAS"
+    echo "════════════════════════════════════════"
+    duckdb -c "
+        SELECT 
+            count(*) as total,
+            round(avg(payload_length), 2) as avg_payload,
+            round(stddev(payload_length), 2) as sd_payload,
+            min(payload_length) as min_payload,
+            max(payload_length) as max_payload,
+            count(DISTINCT worker_id) as workers
+        FROM '$TMP_PARQUET'
+    " -markdown
+}
+
+cmd_outliers() {
+    local col="${1:-payload_length}"
+    export_data
+    echo "════════════════════════════════════════"
+    echo "🔍 OUTLIERS em $col (z-score > 3)"
+    echo "════════════════════════════════════════"
+    duckdb -c "
+        WITH s AS (
+            SELECT avg($col) as m, stddev($col) as sd 
+            FROM '$TMP_PARQUET'
+        )
+        SELECT key, $col, 
+               round(($col - s.m) / NULLIF(s.sd, 0), 2) as z_score
+        FROM '$TMP_PARQUET', s
+        WHERE abs(($col - s.m) / NULLIF(s.sd, 0)) > 3
+        ORDER BY abs(z_score) DESC
+        LIMIT 20
+    " -markdown
+}
+
+cmd_distribution() {
+    local col="${1:-payload_length}"
+    export_data
+    echo "════════════════════════════════════════"
+    echo "📈 DISTRIBUIÇÃO de $col"
+    echo "════════════════════════════════════════"
+    duckdb -c "
+        SELECT 
+            percentile_cont(0.25) WITHIN GROUP (ORDER BY $col) as p25,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY $col) as p50,
+            percentile_cont(0.75) WITHIN GROUP (ORDER BY $col) as p75,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY $col) as p90,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY $col) as p99
+        FROM '$TMP_PARQUET'
+    " -markdown
+}
+
+case "${1:-}" in
+    stats)        cmd_stats ;;
+    outliers)     cmd_outliers "${2:-}" ;;
+    distribution) cmd_distribution "${2:-}" ;;
+    *)
+        echo "Uso:"
+        echo "  ./yoda-stats stats"
+        echo "  ./yoda-stats outliers [coluna]"
+        echo "  ./yoda-stats distribution [coluna]"
+        ;;
+esac

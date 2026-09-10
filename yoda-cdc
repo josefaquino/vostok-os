@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# ============================================================================
+# yoda-cdc - Streaming Change Data Capture (100% Unix, sem Python)
+#
+# Uso:
+#   ./yoda-cdc start [storage] [output.parquet]
+#   ./yoda-cdc stop
+#   ./yoda-cdc status
+# ============================================================================
+
+set +e  # CDC worker não pode sair em erro
+
+STORAGE="${2:-yoda_storage.log}"
+OUTPUT="${3:-stream.parquet}"
+OFFSET_FILE=".cdc-offset"
+PID_FILE=".cdc.pid"
+LOG_FILE=".cdc.log"
+
+cmd_start() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "❌ CDC já rodando (PID $(cat $PID_FILE))"
+        return 1
+    fi
+    
+    [ ! -f "$STORAGE" ] && touch "$STORAGE"
+    
+    _cdc_worker "$STORAGE" "$OUTPUT" "$OFFSET_FILE" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    
+    echo "✅ CDC iniciado (PID $(cat $PID_FILE))"
+    echo "   Storage: $STORAGE"
+    echo "   Output:  $OUTPUT"
+    echo "   Log:     $LOG_FILE"
+}
+
+_cdc_worker() {
+    local storage="$1"
+    local output="$2"
+    local offset_file="$3"
+    
+    # Inicializar Parquet vazio se não existe
+    if [ ! -f "$output" ]; then
+        duckdb -c "
+            CREATE TABLE t AS SELECT
+                0::BIGINT as offset, 0::INTEGER as timestamp,
+                ''::VARCHAR as datetime, 0::INTEGER as worker_id,
+                0::INTEGER as health, ''::VARCHAR as key,
+                ''::VARCHAR as value, 0::BIGINT as payload_length
+            WHERE 1=0;
+            COPY t TO '$output' (FORMAT PARQUET);
+        " 2>/dev/null
+    fi
+    
+    local last_offset=0
+    [ -f "$offset_file" ] && last_offset=$(cat "$offset_file")
+    
+    echo "[$(date)] CDC iniciado. Offset: $last_offset"
+    
+    while true; do
+        sleep 2
+        echo "[$(date)] Heartbeat: offset=$last_offset size=$(stat -c%s "$storage" 2>/dev/null || echo 0)" >> "$LOG_FILE"
+        
+        [ ! -f "$storage" ] && continue
+        
+        local current_size
+        current_size=$(stat -c%s "$storage" 2>/dev/null || echo 0)
+        
+        # Detectar truncamento
+        if [ "$current_size" -lt "$last_offset" ]; then
+            echo "[$(date)] Truncamento detectado. Resetando."
+            last_offset=0
+        fi
+        
+        [ "$current_size" -le "$last_offset" ] && continue
+        
+        local csv_tmp="/tmp/cdc_batch_$$.csv"
+        
+        echo "[$(date)] DEBUG: Chamando tail storage=$storage offset=$last_offset" >> "$LOG_FILE"
+        
+        # Usar yodadb tail (C puro) para extrair novos registros
+        local new_offset
+        new_offset=$(./yodadb tail "$storage" "$last_offset" "$csv_tmp" 2>>"$LOG_FILE")
+        local tail_exit=$?
+        
+        echo "[$(date)] DEBUG: Tail retornou exit=$tail_exit new_offset=$new_offset csv_lines=$(wc -l < "$csv_tmp" 2>/dev/null || echo 0)" >> "$LOG_FILE"
+        
+        if [ -f "$csv_tmp" ] && [ "$(wc -l < "$csv_tmp")" -gt 1 ]; then
+            local new_count=$(( $(wc -l < "$csv_tmp") - 1 ))
+            
+            # Append ao Parquet via DuckDB
+            duckdb -c "
+                CREATE OR REPLACE TABLE new_batch AS SELECT * FROM read_csv_auto('$csv_tmp');
+                CREATE OR REPLACE TABLE existing AS SELECT * FROM '$output';
+                CREATE OR REPLACE TABLE merged AS SELECT * FROM existing UNION ALL SELECT * FROM new_batch;
+                COPY merged TO '$output' (FORMAT PARQUET);
+            " 2>/dev/null
+            
+            echo "[$(date)] Batch: $new_count registros"
+        fi
+        
+        rm -f "$csv_tmp"
+        
+        last_offset=$new_offset
+        echo "$last_offset" > "$offset_file"
+    done
+}
+
+cmd_stop() {
+    if [ ! -f "$PID_FILE" ]; then
+        echo "⚠️  CDC não está rodando"
+        return 1
+    fi
+    
+    local pid
+    pid=$(cat "$PID_FILE")
+    
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        echo "✅ CDC parado (PID $pid)"
+    fi
+    
+    rm -f "$PID_FILE"
+}
+
+cmd_status() {
+    echo "════════════════════════════"
+    echo "📊 CDC STATUS"
+    echo "════════════════════════════"
+    
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "Status: RODANDO (PID $(cat $PID_FILE))"
+    else
+        echo "Status: PARADO"
+    fi
+    
+    if [ -f "$OFFSET_FILE" ]; then
+        echo "Offset: $(cat $OFFSET_FILE) bytes"
+    else
+        echo "Offset: 0"
+    fi
+    
+    if [ -f "$OUTPUT" ]; then
+        local size=$(ls -lh "$OUTPUT" | awk '{print $5}')
+        local count=$(duckdb -c "SELECT count(*) FROM '$OUTPUT'" -csv 2>/dev/null | tail -1)
+        echo "Parquet: $OUTPUT ($size, $count registros)"
+    else
+        echo "Parquet: não existe"
+    fi
+    
+    echo "════════════════════════════"
+}
+
+case "${1:-}" in
+    start)  cmd_start "$@" ;;
+    stop)   cmd_stop ;;
+    status) cmd_status ;;
+    *)
+        echo "Uso:"
+        echo "  ./yoda-cdc start [storage] [output.parquet]"
+        echo "  ./yoda-cdc stop"
+        echo "  ./yoda-cdc status"
+        ;;
+esac

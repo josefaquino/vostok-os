@@ -1,0 +1,316 @@
+package db
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	BloomSize  = 256 * 1024 * 1024
+	MagicByte  = byte(0xAA)
+	HeaderSize = 18
+)
+
+type YodaDB struct {
+	BloomFilter []byte
+	bloomFile   *os.File
+	storageFile *os.File
+	lockFile    *os.File
+	writeBuffer *bufio.Writer
+	mu          sync.RWMutex
+	skipped     uint64
+	Ingested    uint64
+	storagePath string
+	bloomPath   string
+}
+
+func NewYodaDB(bloomPath, storagePath string) (*YodaDB, error) {
+	lockPath := "/tmp/yodadb.lock"
+	lFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("falha ao abrir arquivo de lock: %v", err)
+	}
+
+	if err := syscall.Flock(int(lFile.Fd()), syscall.LOCK_EX); err != nil {
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao adquirir lock: %v", err)
+	}
+
+	bFile, err := os.OpenFile(bloomPath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao abrir arquivo do Bloom Filter: %v", err)
+	}
+
+	fi, err := bFile.Stat()
+	if err != nil {
+		bFile.Close()
+		lFile.Close()
+		return nil, err
+	}
+	if fi.Size() < int64(BloomSize) {
+		if err := bFile.Truncate(int64(BloomSize)); err != nil {
+			bFile.Close()
+			lFile.Close()
+			return nil, fmt.Errorf("falha ao truncar arquivo do Bloom Filter: %v", err)
+		}
+	}
+
+	mmap, err := syscall.Mmap(int(bFile.Fd()), 0, BloomSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		bFile.Close()
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao mapear mmap: %v", err)
+	}
+
+	sFile, err := os.OpenFile(storagePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		syscall.Munmap(mmap)
+		bFile.Close()
+		lFile.Close()
+		return nil, fmt.Errorf("falha ao abrir arquivo de storage: %v", err)
+	}
+
+	return &YodaDB{
+		BloomFilter: mmap,
+		bloomFile:   bFile,
+		storageFile: sFile,
+		lockFile:    lFile,
+		writeBuffer: bufio.NewWriterSize(sFile, 8*1024*1024),
+		storagePath: storagePath,
+		bloomPath:   bloomPath,
+	}, nil
+}
+
+func (db *YodaDB) Close() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.writeBuffer != nil {
+		db.writeBuffer.Flush()
+	}
+	if db.BloomFilter != nil {
+		syscall.Munmap(db.BloomFilter)
+	}
+	if db.bloomFile != nil {
+		db.bloomFile.Close()
+	}
+	if db.storageFile != nil {
+		db.storageFile.Close()
+	}
+	if db.lockFile != nil {
+		syscall.Flock(int(db.lockFile.Fd()), syscall.LOCK_UN)
+		db.lockFile.Close()
+	}
+}
+
+func getBloomIndices(data []byte) (uint32, uint32, uint32) {
+	hash := sha256.Sum256(data)
+	idx1 := binary.BigEndian.Uint32(hash[0:4]) % (BloomSize * 8)
+	idx2 := binary.BigEndian.Uint32(hash[4:8]) % (BloomSize * 8)
+	idx3 := binary.BigEndian.Uint32(hash[8:12]) % (BloomSize * 8)
+	return idx1, idx2, idx3
+}
+
+func (db *YodaDB) CheckAndAdd(payload []byte) bool {
+	db.mu.RLock()
+	idx1, idx2, idx3 := getBloomIndices(payload)
+
+	byteIdx1, bitIdx1 := idx1/8, idx1%8
+	byteIdx2, bitIdx2 := idx2/8, idx2%8
+	byteIdx3, bitIdx3 := idx3/8, idx3%8
+
+	bit1 := (db.BloomFilter[byteIdx1] & (1 << bitIdx1)) != 0
+	bit2 := (db.BloomFilter[byteIdx2] & (1 << bitIdx2)) != 0
+	bit3 := (db.BloomFilter[byteIdx3] & (1 << bitIdx3)) != 0
+
+	exists := bit1 && bit2 && bit3
+	db.mu.RUnlock()
+
+	if !exists {
+		db.mu.Lock()
+		db.BloomFilter[byteIdx1] |= (1 << bitIdx1)
+		db.BloomFilter[byteIdx2] |= (1 << bitIdx2)
+		db.BloomFilter[byteIdx3] |= (1 << bitIdx3)
+		db.mu.Unlock()
+	}
+	return exists
+}
+
+func (db *YodaDB) GatekeeperConverge(payload []byte) bool {
+	if bytes.Contains(payload, []byte("Rate Limit Exceeded")) ||
+		bytes.Contains(payload, []byte("404 Not Found")) ||
+		bytes.Contains(payload, []byte("403 Forbidden")) ||
+		len(payload) < 10 {
+		return false
+	}
+	return true
+}
+
+func (db *YodaDB) WriteRecord(workerID uint32, healthScore uint8, payload []byte) error {
+	payloadSize := uint32(len(payload))
+	timestamp := uint64(time.Now().UnixNano())
+
+	header := make([]byte, HeaderSize)
+	header[0] = MagicByte
+	binary.BigEndian.PutUint64(header[1:9], timestamp)
+	binary.BigEndian.PutUint32(header[9:13], workerID)
+	header[13] = healthScore
+	binary.BigEndian.PutUint32(header[14:18], payloadSize)
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if _, err := db.writeBuffer.Write(header); err != nil {
+		return err
+	}
+	if _, err := db.writeBuffer.Write(payload); err != nil {
+		return err
+	}
+	db.Ingested++
+	return nil
+}
+
+func (db *YodaDB) IngestStream(workerID uint32) {
+	scanner := bufio.NewScanner(os.Stdin)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		if !db.GatekeeperConverge(line) {
+			continue
+		}
+		if db.CheckAndAdd(line) {
+			db.mu.Lock()
+			db.skipped++
+			db.mu.Unlock()
+			continue
+		}
+		_ = db.WriteRecordWithCompression(workerID, 100, line)
+	}
+}
+
+func StreamData(storagePath string, minHealth uint8) {
+	file, err := os.Open(storagePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Falha ao abrir banco de dados de logs: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriterSize(os.Stdout, 256*1024)
+	defer writer.Flush()
+
+	headerBuf := make([]byte, HeaderSize)
+	payloadBuf := make([]byte, 0, 1024*1024)
+
+	for {
+		_, err := io.ReadFull(file, headerBuf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Erro ao ler cabeçalho: %v\n", err)
+			break
+		}
+
+		if headerBuf[0] != MagicByte {
+			fmt.Fprintf(os.Stderr, "Corrupção detectada: Magic byte incorreto!\n")
+			break
+		}
+
+		timestamp := binary.BigEndian.Uint64(headerBuf[1:9])
+		workerID := binary.BigEndian.Uint32(headerBuf[9:13])
+		healthScore := headerBuf[13]
+		payloadSize := binary.BigEndian.Uint32(headerBuf[14:18])
+
+		if healthScore < minHealth {
+			_, err = file.Seek(int64(payloadSize), io.SeekCurrent)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Erro de Seek: %v\n", err)
+				break
+			}
+			continue
+		}
+
+		if uint32(cap(payloadBuf)) < payloadSize {
+			payloadBuf = make([]byte, payloadSize)
+		} else {
+			payloadBuf = payloadBuf[:payloadSize]
+		}
+
+		_, err = io.ReadFull(file, payloadBuf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Erro ao ler payload: %v\n", err)
+			break
+		}
+
+		t := time.Unix(0, int64(timestamp)).UTC().Format(time.RFC3339)
+		fmt.Fprintf(writer, "%d\t%s\t%d\t%d\t%s\n", timestamp, t, workerID, healthScore, string(payloadBuf))
+	}
+}
+
+func RollbackTo(storagePath string, targetTimestamp uint64) {
+	file, err := os.OpenFile(storagePath, os.O_RDWR, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Erro rollback: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	var truncateOffset int64 = 0
+	headerBuf := make([]byte, HeaderSize)
+
+	for {
+		_, err := io.ReadFull(file, headerBuf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+
+		if headerBuf[0] != MagicByte {
+			break
+		}
+
+		timestamp := binary.BigEndian.Uint64(headerBuf[1:9])
+		payloadSize := binary.BigEndian.Uint32(headerBuf[14:18])
+
+		if timestamp > targetTimestamp {
+			break
+		}
+
+		_, err = file.Seek(int64(payloadSize), io.SeekCurrent)
+		if err != nil {
+			break
+		}
+
+		truncateOffset, _ = file.Seek(0, io.SeekCurrent)
+	}
+
+	err = file.Truncate(truncateOffset)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Falha ao aplicar truncamento físico: %v\n", err)
+	} else {
+		fmt.Printf("YodaDB: Viagem temporal concluída! Arquivo truncado no offset %d\n", truncateOffset)
+	}
+}
+
+// WriteRecordWithCompression é a versão comprimida do WriteRecord
+func (db *YodaDB) WriteRecordWithCompression(workerID uint32, healthScore uint8, payload []byte) error {
+	compressed, finalHealth := compressPayload(payload, healthScore)
+	return db.WriteRecord(workerID, finalHealth, compressed)
+}

@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VOSTOK OS — COCKPIT VISUAL v1.0</title>
+    <!-- Tailwind CSS para estilização rápida de nível militar -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- D3.js e Observable Plot para gráficos de próxima geração -->
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&display=swap');
+        body {
+            font-family: 'Fira Code', monospace;
+            user-select: text !important; /* Garante que a seleção de texto esteja sempre ativa no cockpit */
+        }
+        .glow-amber {
+            text-shadow: 0 0 10px rgba(245, 158, 11, 0.5);
+        }
+        .glow-blue {
+            text-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
+        }
+        .border-glow {
+            box-shadow: 0 0 15px rgba(245, 158, 11, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-6 flex flex-col justify-between">
+
+    <!-- HEADER / BARRA SUPERIOR -->
+    <header class="border-b border-amber-500/30 pb-4 mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+        <div>
+            <h1 class="text-2xl font-bold text-amber-500 tracking-wider glow-amber flex items-center gap-2">
+                🚀 VOSTOK OS — COCKPIT VISUAL v1.0
+            </h1>
+            <p class="text-xs text-slate-400 mt-1">Plataforma de Observação Científica de Biomes Públicos (Asus Local)</p>
+        </div>
+        <div class="flex items-center gap-6 text-xs">
+            <div class="bg-slate-900 border border-slate-800 px-3 py-1.5 rounded flex items-center gap-2">
+                <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span>STATUS: VOO TRIPULADO ATIVO</span>
+            </div>
+            <div class="text-right">
+                <span class="text-slate-500 block">COORDENADAS SRE</span>
+                <span class="text-blue-400 font-bold tracking-widest">/home/jose/Vostok</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- PAINEL DE MÉTRICAS (GRID SUPERIOR) -->
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <div class="bg-slate-900/60 border border-slate-800 p-4 rounded-lg border-glow">
+            <span class="text-xs text-slate-500 block uppercase">🧬 Genes/Páginas</span>
+            <span class="text-2xl font-bold text-amber-500 glow-amber" id="stat-genes">0</span>
+            <span class="text-[10px] text-emerald-500 block mt-1" id="stat-growth">Concluídos (DONE)</span>
+        </div>
+        <div class="bg-slate-900/60 border border-slate-800 p-4 rounded-lg">
+            <span class="text-xs text-slate-500 block uppercase">🐜 Total Carregado</span>
+            <span class="text-2xl font-bold text-blue-400 glow-blue" id="stat-total">0</span>
+            <span class="text-[10px] text-slate-400 block mt-1" id="stat-queued">Fila Ativa (QUEUED)</span>
+        </div>
+        <div class="bg-slate-900/60 border border-slate-800 p-4 rounded-lg">
+            <span class="text-xs text-slate-500 block uppercase">⚙️ Seekers Ativos</span>
+            <span class="text-2xl font-bold text-indigo-400" id="stat-workers">20 / 20</span>
+            <span class="text-[10px] text-indigo-300 block mt-1" id="stat-processing">Processando em Lote</span>
+        </div>
+        <div class="bg-slate-900/60 border border-slate-800 p-4 rounded-lg">
+            <span class="text-xs text-slate-500 block uppercase">🛡️ Escudo Taxonômico</span>
+            <span class="text-2xl font-bold text-emerald-400" id="stat-shield-status">ATIVO</span>
+            <span class="text-[10px] text-emerald-500 block mt-1" id="stat-skipped">Pulados / Falhas</span>
+        </div>
+    </section>
+
+    <!-- CORPO DO COCKPIT (CONTEÚDO PRINCIPAL) -->
+    <main class="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-grow mb-6">
+        
+        <!-- ESQUERDA: GRÁFICOS ANALÍTICOS (7 COLUNAS) -->
+        <section class="lg:col-span-7 flex flex-col gap-6">
+            
+            <!-- BIOMES E DISTRIBUIÇÃO -->
+            <div class="bg-slate-900/40 border border-slate-900 p-5 rounded-xl flex-grow flex flex-col justify-between">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-sm font-bold text-amber-500 border-l-2 border-amber-500 pl-2 uppercase">
+                        Distribuição Taxonômica de Biomes / Status
+                    </h2>
+                    <span class="text-[10px] text-slate-500">Mapeamento de Carga do Ninho</span>
+                </div>
+                <!-- Gráfico de Barras Colunar (Observable Plot) -->
+                <div id="chart-biomes" class="w-full flex justify-center bg-slate-950/50 p-2 rounded border border-slate-900"></div>
+            </div>
+
+            <!-- CURVA DE RESILIÊNCIA E RISCO -->
+            <div class="bg-slate-900/40 border border-slate-900 p-5 rounded-xl flex-grow flex flex-col justify-between">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-sm font-bold text-blue-400 border-l-2 border-blue-400 pl-2 uppercase">
+                        Histórico e Evolução das Coletas Recentes
+                    </h2>
+                    <span class="text-[10px] text-slate-500">Taxa de Sucesso vs Falhas</span>
+                </div>
+                <!-- Gráfico de Linha Interativo -->
+                <div id="chart-resilience" class="w-full flex justify-center bg-slate-950/50 p-2 rounded border border-slate-900"></div>
+            </div>
+
+        </section>
+
+        <!-- DIREITA: TERMINAL DE LOGS EM TEMPO REAL (5 COLUNAS) -->
+        <section class="lg:col-span-5 bg-slate-950 border border-slate-900 rounded-xl p-5 flex flex-col justify-between h-[500px] lg:h-auto">
+            <div class="flex justify-between items-center border-b border-slate-900 pb-3 mb-3">
+                <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
+                    <h2 class="text-sm font-bold text-amber-500 uppercase">Observatório em Tempo Real</h2>
+                </div>
+                <span class="text-[10px] text-slate-500">Fila Recente de Observações</span>
+            </div>
+
+            <!-- FEED DO TERMINAL -->
+            <div id="terminal-feed" class="flex-grow overflow-y-auto text-xs text-slate-400 space-y-3.5 pr-2 font-mono scrollbar-thin scrollbar-thumb-slate-800 scrollbar-track-transparent">
+                <!-- Inseridos dinamicamente por JS -->
+            </div>
+
+            <!-- BARRA DE ENTRADA DO TERMINAL -->
+            <div class="mt-4 pt-3 border-t border-slate-900 flex items-center justify-between text-[10px] text-slate-500">
+                <span>Vostok Console v2.0 (Real-Time)</span>
+                <span>Auto-Refresh: Ativo (2s)</span>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="border-t border-slate-900 pt-4 flex flex-col sm:flex-row justify-between items-center text-xs text-slate-500 gap-2">
+        <p>© 2026 Vostok OS Project. Todos os direitos reservados.</p>
+        <p class="flex items-center gap-2">
+            <span>Desenvolvido localmente com a Força do Unix</span>
+            <span class="text-amber-500">⚡</span>
+        </p>
+    </footer>
+
+    <!-- LOGICA SRE DE INTEGRAÇÃO REAL-TIME -->
+    <script>
+        // Fallback data para testes offline se a conexão Go falhar
+        const fallbackBiomes = [
+            { category: "DONE", count: 49 },
+            { category: "SKIPPED", count: 1 }
+        ];
+
+        // 1. RENDERIZAR GRÁFICO DE BARRAS DE STATUS DO BANCO
+        function renderBiomesChart(data) {
+            const biomesPlot = Plot.plot({
+                style: {
+                    background: "transparent",
+                    color: "#94a3b8",
+                    fontFamily: "inherit"
+                },
+                x: {
+                    grid: true,
+                    label: "Quantidade de Páginas →",
+                    ticks: 5
+                },
+                y: {
+                    label: null,
+                    tickSize: 0
+                },
+                marks: [
+                    Plot.barX(data, {
+                        x: "count",
+                        y: "category",
+                        fill: d => {
+                            if (d.category === "DONE") return "#10b981"; // Verde
+                            if (d.category === "QUEUED") return "#3b82f6"; // Azul
+                            if (d.category === "FAILED") return "#ef4444"; // Vermelho
+                            return "#f59e0b"; // Amarelo
+                        },
+                        rx: 4,
+                        sort: { y: "x", reverse: true }
+                    }),
+                    Plot.text(data, {
+                        x: "count",
+                        y: "category",
+                        text: d => d.count,
+                        textAnchor: "start",
+                        dx: 6,
+                        fill: "#cbd5e1"
+                    })
+                ],
+                marginRight: 40
+            });
+            document.getElementById("chart-biomes").innerHTML = "";
+            document.getElementById("chart-biomes").appendChild(biomesPlot);
+        }
+
+        // 2. RENDERIZAR GRÁFICO DE EVOLUÇÃO TEMPORAL
+        function renderResilienceChart(historyData) {
+            const resiliencePlot = Plot.plot({
+                style: {
+                    background: "transparent",
+                    color: "#94a3b8",
+                    fontFamily: "inherit"
+                },
+                y: {
+                    grid: true,
+                    label: "↑ Registro de Observações"
+                },
+                x: {
+                    label: "Índice Temporal",
+                    tickFormat: "d"
+                },
+                marks: [
+                    Plot.lineY(historyData, {
+                        x: "index",
+                        y: "value",
+                        stroke: "#3b82f6",
+                        strokeWidth: 2.5
+                    }),
+                    Plot.dot(historyData, {
+                        x: "index",
+                        y: "value",
+                        fill: "#3b82f6",
+                        r: 4
+                    })
+                ]
+            });
+            document.getElementById("chart-resilience").innerHTML = "";
+            document.getElementById("chart-resilience").appendChild(resiliencePlot);
+        }
+
+        // 3. ATUALIZAR FEED DO TERMINAL COM AS OBSERVAÇÕES REAIS DO GO
+        function updateTerminalFeed(observations) {
+            const feed = document.getElementById("terminal-feed");
+            feed.innerHTML = ""; // Limpa para evitar duplicados
+
+            if (!observations || observations.length === 0) {
+                feed.innerHTML = '<p class="text-slate-500 text-center py-8">Nenhuma observação pendente na esteira física.</p>';
+                return;
+            }
+
+            observations.slice(0, 10).forEach(obs => {
+                const logEl = document.createElement("div");
+                logEl.className = "border-l-2 border-slate-800 pl-3 py-1 bg-slate-900/30 rounded-r hover:bg-slate-900/50 transition-colors";
+                
+                let statusColor = "text-emerald-400";
+                if (obs.status === "FAILED") statusColor = "text-red-400";
+                if (obs.status === "QUEUED") statusColor = "text-blue-400";
+                if (obs.status === "PROCESSING") statusColor = "text-amber-400";
+
+                const displayTitle = obs.title ? obs.title : "Carregando metadados...";
+                const timeStr = new Date(obs.timestamp).toLocaleTimeString();
+
+                logEl.innerHTML = `
+                    <div class="flex justify-between items-center text-[10px]">
+                        <span class="text-blue-400 font-semibold">[${obs.biome.toUpperCase()}]</span>
+                        <span class="text-slate-500">${obs.id} (${timeStr})</span>
+                    </div>
+                    <p class="text-[11px] text-slate-300 font-bold mt-0.5 truncate">${displayTitle}</p>
+                    <p class="text-[10px] text-slate-500 font-mono truncate">${obs.source_url}</p>
+                    <div class="flex justify-between items-center mt-1 text-[10px]">
+                        <span class="${statusColor}">● ${obs.status}</span>
+                        <span class="text-amber-500 font-bold">VER: ${obs.driver_version}</span>
+                    </div>
+                `;
+                feed.appendChild(logEl);
+            });
+        }
+
+        // Histórico simulado para preencher a curva visual
+        let mockHistory = Array.from({ length: 12 }, (_, i) => ({ index: i, value: Math.floor(Math.sin(i * 0.5) * 10 + 20 + Math.random() * 5) }));
+
+        // 4. CHAMADA DE CONEXÃO DE REDE RECORRENTE (API POLL)
+        async function fetchAPIData() {
+            try {
+                const [statsRes, obsRes] = await Promise.all([
+                    fetch('/api/stats'),
+                    fetch('/api/observations')
+                ]);
+                
+                if (statsRes.ok && obsRes.ok) {
+                    const stats = await statsRes.json();
+                    const observations = await obsRes.json();
+
+                    // Atualizar os contadores estatísticos na tela
+                    document.getElementById("stat-genes").innerText = (stats.by_status.DONE || 0).toLocaleString();
+                    document.getElementById("stat-total").innerText = stats.total_genes.toLocaleString();
+                    document.getElementById("stat-queued").innerText = "Fila Ativa: " + (stats.by_status.QUEUED || 0).toLocaleString();
+                    document.getElementById("stat-workers").innerText = (stats.active_seekers || 20) + " / 20";
+                    document.getElementById("stat-processing").innerText = "SRE Ativo: " + (stats.by_status.PROCESSING || 0).toLocaleString() + " processando";
+                    
+                    const skippedCount = (stats.by_status.SKIPPED || 0) + (stats.by_status.INVALID || 0);
+                    const failedCount = (stats.by_status.FAILED || 0);
+                    document.getElementById("stat-skipped").innerText = "P: " + skippedCount.toLocaleString() + " | F: " + failedCount.toLocaleString();
+
+                    // Mapear dados de biomas e status para o gráfico colunar
+                    const chartData = Object.keys(stats.by_status).map(key => ({
+                        category: key,
+                        count: stats.by_status[key]
+                    }));
+                    renderBiomesChart(chartData);
+
+                    // Adiciona tempo real na curva visual
+                    if (mockHistory.length > 20) mockHistory.shift();
+                    mockHistory.push({ index: mockHistory[mockHistory.length - 1].index + 1, value: stats.total_genes });
+                    renderResilienceChart(mockHistory);
+
+                    // Atualizar o observatório de logs com registros reais
+                    updateTerminalFeed(observations);
+                    
+                    console.log("Cockpit atualizado dinamicamente às " + new Date().toLocaleTimeString());
+                } else {
+                    throw new Error("Resposta inválida do barramento de API");
+                }
+            } catch (err) {
+                console.warn("API offline. Ativando Fallback SRE de simulação.");
+                
+                // Dados estáticos simulados em caso de falha física do Go
+                document.getElementById("stat-genes").innerText = "29.154.397";
+                document.getElementById("stat-total").innerText = "50.000";
+                document.getElementById("stat-queued").innerText = "Simulador Local";
+                document.getElementById("stat-workers").innerText = "10 / 10";
+                document.getElementById("stat-processing").innerText = "Simulação Ativa";
+                document.getElementById("stat-skipped").innerText = "Escudo: ATIVO";
+
+                const staticStatus = [
+                    { category: "DONE", count: 49 },
+                    { category: "SKIPPED", count: 1 }
+                ];
+                renderBiomesChart(staticStatus);
+                renderResilienceChart(mockHistory);
+                
+                // Popula feed com observações fictícias para manter a interface utilizável
+                const mockObs = [
+                    { id: "vst-nlp-101", biome: "cvm_companhia", source_url: "https://dados.cvm.gov.br/.../dfp_2026.zip", title: "DFP PETROBRAS 2026 - ANÁLISE DE RISCO", status: "DONE", driver_version: "vostok-cli-nlp:v3.0", timestamp: new Date().toISOString() },
+                    { id: "vst-git-001", biome: "github_repository", source_url: "https://github.com/golang/go", title: "golang/go: linguagem open-source module", status: "DONE", driver_version: "vostok-github-driver:v3.0", timestamp: new Date().toISOString() }
+                ];
+                updateTerminalFeed(mockObs);
+            }
+        }
+
+        // Disparo imediato na carga inicial
+        fetchAPIData();
+
+        // Inicializar o loop de auto-atualização contínua de 2 em 2 segundos
+        setInterval(fetchAPIData, 2000);
+    </script>
+</body>
+</html>

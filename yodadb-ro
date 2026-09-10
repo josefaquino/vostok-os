@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ============================================================================
+# yodadb-ro - Read-only wrapper para YodaDB
+#
+# Implementa Single-Writer / Multi-Reader via flock LOCK_SH
+# Bloqueia operações de escrita
+# ============================================================================
+
+set -e
+
+STORAGE="yoda_storage.log"
+LOCKFILE="$STORAGE.ro.lock"
+
+# Comandos permitidos em read-only
+ALLOWED_CMDS="get|stats|export|tail"
+
+# Validar comando
+CMD="${1:-}"
+if ! echo "$CMD" | grep -qE "^($ALLOWED_CMDS)$"; then
+    echo "❌ Erro: '$CMD' não permitido em read-only mode" >&2
+    echo "   Comandos permitidos: get, stats, export, tail" >&2
+    exit 1
+fi
+
+# Adquirir lock compartilhado e executar
+(
+    flock -s 200
+    
+    # Executar yodadb com os argumentos originais
+    exec ./yodadb "$@"
+    
+) 200>"$LOCKFILE"

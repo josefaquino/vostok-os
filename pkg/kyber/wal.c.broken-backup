@@ -1,0 +1,46 @@
+#define _POSIX_C_SOURCE 200809L
+#include "kyber_btree.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+
+// Estrutura interna do WAL (simplificada para atender ao contrato)
+struct KyberWAL {
+    int fd;
+    char path[1024];
+};
+
+// Como o contrato não define uma API WAL explícita, implementamos
+// as funções de log internas para serem usadas pelo btree.c.
+// O btree.c já chama write() diretamente no wal_fd.
+// Este arquivo serve como ponto de extensão para recovery.
+
+// Função de recovery: reaplica as operações do WAL após crash.
+int kyber_wal_recover(const char *wal_path, KyberBTree *t) {
+    int fd = open(wal_path, O_RDONLY);
+    if (fd < 0) return 0; // sem WAL
+    uint8_t op;
+    uint32_t klen, vlen;
+    char key[1024], val[1024];
+    while (read(fd, &op, 1) == 1) {
+        if (op == 1) { // PUT
+            read(fd, &klen, 4);
+            read(fd, &vlen, 4);
+            read(fd, key, klen);
+            read(fd, val, vlen);
+            kyber_btree_put(t, key, klen, val, vlen);
+        } else if (op == 2) { // DELETE
+            read(fd, &klen, 4);
+            read(fd, key, klen);
+            kyber_btree_delete(t, key, klen);
+        }
+    }
+    close(fd);
+    // truncar WAL após recovery
+    fd = open(wal_path, O_RDWR | O_TRUNC);
+    if (fd >= 0) close(fd);
+    return 0;
+}
