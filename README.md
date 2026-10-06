@@ -1,3 +1,11 @@
+> **HISTORICAL PREDECESSOR — no longer the canonical active project.**
+>
+> Active work continues in [Yoda](https://github.com/josefaquino/Yoda).
+>
+> Historical role: low-level YodaDB/Kyber systems experiments, durability mechanisms, CDC, recovery, benchmarking, and early agent-oriented storage work.
+>
+> This repository is preserved as project provenance.
+
 # YodaDB v10
 
 Banco de dados local-first em C11 puro para agentes de IA.
